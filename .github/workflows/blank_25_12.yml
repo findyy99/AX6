@@ -1,0 +1,359 @@
+# =============================================================================
+# GitHub Actions Workflow: Build qosmio/openwrt-ipq (24.10-nss)
+# =============================================================================
+#
+# 【使用说明】
+# 1. 将此文件放到你的仓库：.github/workflows/build-openwrt-nss.yml
+# 2. 将你的自定义 .config 文件上传到仓库根目录（与此 workflow 同仓库）
+#    路径：configs/my.config
+#    （你可以在下方 "USER CONFIG" 区域修改路径）
+# 3. 在 GitHub Actions 页面手动触发，或 push 时自动触发
+#
+# 【仓库结构示意】
+# your-repo/
+# ├── .github/
+# │   └── workflows/
+# │       └── build-openwrt-nss.yml   ← 本文件
+# └── configs/
+#     └── my.config                   ← ★ 你手动上传的 .config 放这里 ★
+#
+# 【预计编译时间】2~4 小时（GitHub hosted runner: ubuntu-latest, 4核）
+# =============================================================================
+
+name: Build OpenWrt NSS (25.12-nss)
+
+# --------------------------------------------------------------------------
+# 触发条件：支持手动触发 + push 时触发（可按需调整）
+# --------------------------------------------------------------------------
+on:
+  workflow_dispatch:          # ← 手动点击 "Run workflow" 触发
+    inputs:
+      upload_release:
+        description: '是否上传固件到 GitHub Releases'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+  # 如需 push 自动触发，取消下面的注释：
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - 'configs/my.config'   # 仅 config 有变化时才触发
+
+# --------------------------------------------------------------------------
+# 权限：发布 Release 需要 write 权限
+# --------------------------------------------------------------------------
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build OpenWrt NSS Firmware
+    runs-on: ubuntu-24.04      # 固定版本，避免 ubuntu-latest 升级导致依赖变化
+
+    # 最长运行时间，防止卡死占用 runner（GitHub 免费额度上限 6h）
+    timeout-minutes: 330
+
+    steps:
+
+      # ======================================================================
+      # STEP 1: 检出【你自己的仓库】（获取 configs/my.config）
+      # ======================================================================
+      - name: Checkout your repo (for custom config)
+        uses: actions/checkout@v4
+        with:
+          path: my-repo          # 检出到子目录，避免和源码混淆
+
+      # ======================================================================
+      # STEP 2: 验证自定义 .config 存在
+      # ======================================================================
+      - name: Validate custom config exists
+        run: |
+          # ★★★ USER CONFIG：如果你的 config 路径不同，在这里修改 ★★★
+          CONFIG_SRC="my-repo/.25_12_config"
+
+          if [ ! -f "${CONFIG_SRC}" ]; then
+            echo "❌ 错误：未找到自定义 config 文件：${CONFIG_SRC}"
+            echo "请将你的 .config 文件上传到仓库的 .config"
+            exit 1
+          fi
+          echo "✅ 找到自定义 config：${CONFIG_SRC}"
+          echo "CONFIG_SRC=${CONFIG_SRC}" >> "${GITHUB_ENV}"
+
+      # ======================================================================
+      # STEP 3: 释放磁盘空间（ubuntu-latest 默认只有约 25GB 可用）
+      # OpenWrt 完整编译需要约 20~30GB，必须先清理
+      # ======================================================================
+      - name: Free up disk space
+        run: |
+          echo "📊 清理前可用空间："
+          df -h
+
+          echo "→ 移除 Android SDK..."
+          sudo rm -rf /usr/local/lib/android
+
+          echo "→ 移除 .NET Core..."
+          sudo rm -rf /usr/share/dotnet
+
+          echo "→ 移除 PowerShell..."
+          sudo rm -rf /opt/microsoft/powershell
+
+          echo "→ 移除 CodeQL..."
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+
+          echo "→ 移除 Homebrew (Linux)..."
+          sudo rm -rf /home/linuxbrew/.linuxbrew/
+
+          echo "→ 移除冗余 apt 包..."
+          sudo apt-get autoremove -y 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "→ 移除 Node.js 模块..."
+          sudo rm -rf /usr/local/lib/node_modules
+
+          echo "→ 移除 Swift / Kotlin / Rust..."
+          sudo rm -rf /usr/share/swift /usr/share/kotlin /usr/share/rust
+
+          echo "→ 清理 Docker 镜像..."
+          docker image prune -a -f 2>/dev/null || true
+
+          echo "→ 移除 Java 工具链..."
+          sudo rm -rf /opt/hostedtoolcache/Java_*
+          sudo rm -rf /opt/hostedtoolcache/Ruby_*
+          sudo rm -rf /opt/hostedtoolcache/PyPy_*
+          sudo rm -rf /opt/az
+
+          echo "→ 移除 Python dist-packages..."
+          sudo rm -rf /usr/local/lib/python*/dist-packages
+          sudo rm -rf /usr/local/lib/python*/site-packages
+
+          echo "📊 清理后可用空间："
+          df -h
+
+      # ======================================================================
+      # STEP 4: 安装编译依赖
+      # 参考：https://openwrt.org/docs/guide-developer/toolchain/install-buildsystem
+      # ======================================================================
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            build-essential \
+            clang \
+            flex \
+            bison \
+            g++ \
+            gawk \
+            gcc-multilib \
+            g++-multilib \
+            gettext \
+            git \
+            libncurses5-dev \
+            libssl-dev \
+            python3-setuptools \
+            rsync \
+            swig \
+            unzip \
+            zlib1g-dev \
+            file \
+            wget \
+            qemu-utils \
+            xxd
+          echo "✅ 依赖安装完成"
+
+      # ======================================================================
+      # STEP 5: 克隆上游源码（qosmio/openwrt-ipq 24.10-nss 分支）
+      # 使用 --depth=1 浅克隆加速，节省时间和空间
+      # ======================================================================
+      - name: Clone qosmio/openwrt-ipq (24.10-nss)
+        run: |
+          echo "📥 克隆上游 NSS 源码..."
+          git clone \
+            --depth=1 \
+            --branch 25.12-nss \
+            https://github.com/qosmio/openwrt-ipq.git \
+            openwrt-src
+          echo "✅ 克隆完成"
+          echo "当前 HEAD："
+          git -C openwrt-src log --oneline -3
+
+      # ======================================================================
+      # STEP 6: 更新 Feeds
+      # ======================================================================
+      - name: Update and install feeds
+        working-directory: openwrt-src
+        run: |
+          echo "📦 更新 feeds..."
+          ./scripts/feeds update -a
+          echo "📦 安装 feeds..."
+          ./scripts/feeds install -a
+          echo "✅ Feeds 完成"
+
+      # ======================================================================
+      # STEP 7: 复制你的自定义 .config
+      # ★★★ 这是你自定义 config 的注入点 ★★★
+      # ======================================================================
+      - name: Copy custom .config
+        run: |
+          echo "📋 复制自定义 config..."
+          cp "${CONFIG_SRC}" openwrt-src/.config
+          echo "✅ .config 已复制到 openwrt-src/.config"
+          echo "--- config 前 20 行预览 ---"
+          head -20 openwrt-src/.config
+
+      # ======================================================================
+      # STEP 8: 生成完整 config（make defconfig）
+      # 补全 .config 中未显式设置的选项为默认值
+      # ======================================================================
+      - name: Generate full config (make defconfig)
+        working-directory: openwrt-src
+        run: |
+          echo "⚙️ 运行 make defconfig..."
+          make defconfig V=s
+          echo "✅ defconfig 完成"
+          echo "--- TARGET 相关配置确认 ---"
+          grep "^CONFIG_TARGET" .config | head -20
+
+      # ======================================================================
+      # STEP 9: 下载源码包（dl/）
+      # 使用多线程下载，失败不停止（网络问题常见，后续 make 会重试）
+      # ======================================================================
+      - name: Download package sources
+        working-directory: openwrt-src
+        run: |
+          echo "⬇️ 下载源码包..."
+          make download -j$(nproc) V=s 2>&1 | tee /tmp/download.log || true
+          # 检查是否有严重的下载失败（.tmp 文件残留）
+          find dl/ -name "*.tmp" -delete 2>/dev/null || true
+          echo "✅ 下载完成（部分失败可忽略，编译时会重试）"
+          echo "📊 dl/ 目录大小："
+          du -sh dl/ 2>/dev/null || true
+
+      # ======================================================================
+      # STEP 10: 编译 tools（make tools/install）
+      # 失败时降级到单线程 + verbose 模式方便排错
+      # ======================================================================
+      - name: Build tools
+        working-directory: openwrt-src
+        run: |
+          echo "🔨 编译 tools（并行：$(nproc) 线程）..."
+          make tools/install -j$(nproc) V=s \
+            || { echo "⚠️ 并行失败，降级单线程重试..."; make tools/install -j1 V=sc; }
+          echo "✅ tools 编译完成"
+
+      # ======================================================================
+      # STEP 11: 编译 toolchain（make toolchain/install）
+      # ======================================================================
+      - name: Build toolchain
+        working-directory: openwrt-src
+        run: |
+          echo "🔨 编译 toolchain（并行：$(nproc) 线程）..."
+          make toolchain/install -j$(nproc) V=s \
+            || { echo "⚠️ 并行失败，降级单线程重试..."; make toolchain/install -j1 V=sc; }
+          echo "✅ toolchain 编译完成"
+
+      # ======================================================================
+      # STEP 12: 再次下载（某些 NSS 包需要 toolchain 就绪后才能解析下载地址）
+      # ======================================================================
+      - name: Download package sources (2nd pass)
+        working-directory: openwrt-src
+        run: |
+          echo "⬇️ 二次下载（补全 NSS 相关包）..."
+          make download -j$(nproc) V=s 2>&1 || true
+          find dl/ -name "*.tmp" -delete 2>/dev/null || true
+          echo "✅ 二次下载完成"
+
+      # ======================================================================
+      # STEP 13: 编译固件（make -j$(nproc)）
+      # 这是最耗时的步骤，约 1~3 小时
+      # ======================================================================
+      - name: Build OpenWrt NSS firmware
+        working-directory: openwrt-src
+        run: |
+          echo "🚀 开始完整编译..."
+          echo "⏰ 开始时间：$(date)"
+          echo "💾 当前磁盘空间："
+          df -h
+
+          make -j$(nproc) V=s \
+            || { echo "⚠️ 并行编译失败，降级单线程获取详细错误..."; make -j1 V=sc; }
+
+          echo "✅ 编译完成！"
+          echo "⏰ 结束时间：$(date)"
+
+      # ======================================================================
+      # STEP 14: 列出编译产物
+      # ======================================================================
+      - name: List firmware artifacts
+        working-directory: openwrt-src
+        run: |
+          echo "📦 编译产物（bin/targets/）："
+          find bin/targets/ -type f | sort
+          echo ""
+          echo "📊 固件文件大小："
+          find bin/targets/ -type f \( -name "*.bin" -o -name "*.img" -o -name "*.gz" \) \
+            -exec ls -lh {} \;
+
+      # ======================================================================
+      # STEP 15: 准备环境变量（供 Release 使用）
+      # ======================================================================
+      - name: Prepare release metadata
+        run: |
+          echo "SHORT_SHA=$(echo ${GITHUB_SHA} | cut -c1-8)" >> "${GITHUB_ENV}"
+          echo "BUILD_DATE=$(date +%Y%m%d-%H%M)" >> "${GITHUB_ENV}"
+          # 读取 .config 中的 TARGET 信息
+          TARGET=$(grep "^CONFIG_TARGET_BOARD=" openwrt-src/.config | cut -d'"' -f2 || echo "unknown")
+          SUBTARGET=$(grep "^CONFIG_TARGET_SUBTARGET=" openwrt-src/.config | cut -d'"' -f2 || echo "unknown")
+          echo "TARGET=${TARGET}" >> "${GITHUB_ENV}"
+          echo "SUBTARGET=${SUBTARGET}" >> "${GITHUB_ENV}"
+          echo "RELEASE_TAG=openwrt-nss-${TARGET}-${SUBTARGET}-$(date +%Y%m%d-%H%M)" >> "${GITHUB_ENV}"
+
+      # ======================================================================
+      # STEP 16: 上传固件为 Artifact（无论是否发 Release，都保留 7 天）
+      # ======================================================================
+      - name: Upload firmware as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-nss-firmware-${{ env.BUILD_DATE }}
+          path: |
+            openwrt-src/bin/targets/**/*.ubi
+            openwrt-src/bin/targets/**/*.bin
+            openwrt-src/bin/targets/**/*.img
+            openwrt-src/bin/targets/**/*.gz
+            openwrt-src/bin/targets/**/*.manifest
+            openwrt-src/bin/targets/**/*.buildinfo
+          retention-days: 7
+          if-no-files-found: warn
+
+      # ======================================================================
+      # STEP 17: 发布 GitHub Release（仅在手动触发且选择 true 时）
+      # ======================================================================
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.upload_release == 'true' }}
+        uses: ncipollo/release-action@v1
+        with:
+          name: "OpenWrt NSS ${{ env.TARGET }}-${{ env.SUBTARGET }} | ${{ env.BUILD_DATE }}"
+          tag: "${{ env.RELEASE_TAG }}"
+          body: |
+            ## OpenWrt NSS 固件
+
+            - **源码分支**：qosmio/openwrt-ipq @ 24.10-nss
+            - **编译时间**：${{ env.BUILD_DATE }}
+            - **Commit**：${{ github.sha }}
+            - **Target**：${{ env.TARGET }} / ${{ env.SUBTARGET }}
+
+            ### 注意事项
+            - 首次刷入建议不保留配置
+            - 禁用 Flow Offloading / Packet Steering（与 NSS 不兼容）
+          generateReleaseNotes: false
+          makeLatest: true
+          artifacts: |
+            openwrt-src/bin/targets/**/*.ubi
+            openwrt-src/bin/targets/**/*.bin
+            openwrt-src/bin/targets/**/*.img.gz
+          token: "${{ secrets.GITHUB_TOKEN }}"
