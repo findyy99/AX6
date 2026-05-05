@@ -321,6 +321,7 @@ jobs:
         with:
           name: openwrt-nss-firmware-${{ env.BUILD_DATE }}
           path: |
+            openwrt-src/bin/targets/**/*.ubi
             openwrt-src/bin/targets/**/*.bin
             openwrt-src/bin/targets/**/*.img
             openwrt-src/bin/targets/**/*.gz
@@ -352,6 +353,7 @@ jobs:
           generateReleaseNotes: false
           makeLatest: true
           artifacts: |
+            openwrt-src/bin/targets/**/*.ubi
             openwrt-src/bin/targets/**/*.bin
             openwrt-src/bin/targets/**/*.img.gz
           token: "${{ secrets.GITHUB_TOKEN }}"
